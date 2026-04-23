@@ -129,6 +129,30 @@ agent-vm --offline --readonly claude   # Both
 
 ## Customization
 
+### Extra host mounts: `~/.agent-vm/volumes`
+
+List host files or directories to mount inside every VM. One path per line, `~` is expanded, `#` starts a comment. Uses Docker Compose-style `source[:destination][:mode]` syntax, where `mode` is `ro` (default) or `rw`:
+
+```bash
+# ~/.agent-vm/volumes
+
+# Mount at the same path in the VM (read-only)
+~/.gitconfig
+~/.gitignore
+
+# Mount at a different path in the VM (read-only)
+~/.claude:/home/$USER.linux/.claude
+
+# Writable directory
+~/.cache/shared:/home/$USER.linux/.cache/shared:rw
+```
+
+When no destination is specified, the path is mounted at the same location inside the VM. Non-existent paths are skipped with a warning. Changes to this file take effect on new VMs (use `--reset` to re-apply to existing ones).
+
+`rw` is only supported for **directories**. Files are always read-only: with the hardlink/staging strategy used below, writable file mounts would silently desync on cross-filesystem setups. If you need a writable single file, mount its parent directory as `rw` instead. A destination literally named `ro` or `rw` is treated as a mode keyword — append an explicit `:ro`/`:rw` to disambiguate.
+
+Individual files are supported without exposing their parent directory: agent-vm hardlinks the source into a per-VM staging dir under `~/.agent-vm/file-mounts/<vm>/`, then bind-mounts it at the final destination on each VM start. If the source sits on a different filesystem (hardlink impossible), it falls back to a copy and live host changes won't propagate until the next VM restart. The staged hardlink is refreshed on each `agent-vm` invocation, so atomic-rename edits (common in editors) are picked up at the next VM (re)start.
+
 ### Per-user setup: `~/.agent-vm/setup.sh`
 
 Create this file to install extra tools into the base VM template. It runs once during `agent-vm setup`, as the default VM user (with sudo available):

@@ -43,6 +43,35 @@ _agent_vm_running() {
   limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | grep -q "^${1} Running$"
 }
 
+# Stage a single host file at <dst> via hardlink, falling back to copy if the
+# source and destination live on different filesystems. Hardlinking keeps the
+# content live-synced with the host (same inode) without exposing the source's
+# parent directory to the VM. The copy fallback preserves the no-exposure
+# property but loses live sync until the next VM (re)start.
+_agent_vm_stage_file() {
+  local src="$1" dst="$2"
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+  rm -f "$dst"
+  if ln "$src" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  if cp -p "$src" "$dst" 2>/dev/null; then
+    echo "Warning: Staged '${src}' via copy (cross-filesystem hardlink failed); live host changes will not propagate until VM (re)start." >&2
+    return 0
+  fi
+  return 1
+}
+
+# Remove all per-VM state files (version marker, caches, staging dirs).
+# Called after a VM is deleted or before it is re-cloned via --reset.
+_agent_vm_cleanup_state() {
+  local vm_name="$1"
+  rm -f "$AGENT_VM_STATE_DIR/.agent-vm-version-${vm_name}"
+  rm -f "$AGENT_VM_STATE_DIR/.agent-vm-term-${vm_name}"
+  rm -f "$AGENT_VM_STATE_DIR/.agent-vm-file-mounts-${vm_name}"
+  rm -rf "$AGENT_VM_STATE_DIR/file-mounts/${vm_name}"
+}
+
 # Print VM resource details (CPUs, memory, disk)
 _agent_vm_print_resources() {
   local vm_name="$1"
@@ -87,18 +116,104 @@ _agent_vm_ensure_running() {
     echo "Resetting VM '$vm_name'..."
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
-    rm -f "$AGENT_VM_STATE_DIR/.agent-vm-version-${vm_name}"
-    rm -f "$AGENT_VM_STATE_DIR/.agent-vm-term-${vm_name}"
+    _agent_vm_cleanup_state "$vm_name"
   fi
 
+  local is_new_vm=""
+  local file_mount_entries=()
+  local file_mounts_cache="$AGENT_VM_STATE_DIR/.agent-vm-file-mounts-${vm_name}"
+
   if ! _agent_vm_exists "$vm_name"; then
+    is_new_vm=1
+
+    # Build mounts JSON only at creation: project dir (writable) + extra mounts from ~/.agent-vm/volumes (read-only)
+    local mounts_json="[{\"location\": \"${host_dir}\", \"writable\": true}"
+    local mounts_file="$AGENT_VM_STATE_DIR/volumes"
+    if [[ -f "$mounts_file" ]]; then
+      local staging_idx=0
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"                                          # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"                     # trim leading whitespace
+        line="${line%"${line##*[![:space:]]}"}"                     # trim trailing whitespace
+        [[ -z "$line" ]] && continue
+        # Parse source[:destination][:mode] syntax (like docker compose volumes).
+        # The trailing mode segment is only recognized when it equals "ro" or
+        # "rw" — anything else is treated as a destination path.
+        local src="$line" dst="" mode="ro"
+        if [[ "$line" == *:ro || "$line" == *:rw ]]; then
+          mode="${line##*:}"
+          line="${line%:*}"
+        fi
+        if [[ "$line" == *:* ]]; then
+          src="${line%%:*}"
+          dst="${line#*:}"
+        else
+          src="$line"
+        fi
+        src="${src/#\~/$HOME}"                                      # expand ~
+        # Reject characters that would break JSON interpolation below or the
+        # pipe-separated cache format used for file mounts.
+        if [[ "$src" == *[$'"\\\n|']* || "$dst" == *[$'"\\\n|']* ]]; then
+          echo "Warning: Mount entry '${line}' (from ~/.agent-vm/volumes) contains invalid characters (quote/backslash/newline/pipe), skipping." >&2
+          continue
+        fi
+        if [[ ! -e "$src" ]]; then
+          echo "Warning: Mount path '${src}' (from ~/.agent-vm/volumes) does not exist, skipping." >&2
+          continue
+        fi
+        if [[ -f "$src" ]]; then
+          if [[ "$mode" == "rw" ]]; then
+            echo "Warning: Mount entry '${line}' (from ~/.agent-vm/volumes) requests rw on a file; only directories support rw. Mount the parent directory instead. Skipping." >&2
+            continue
+          fi
+          # File mount: hardlink the source into a per-VM host staging dir so
+          # the VM sees only this file (never the source's parent). Lima mounts
+          # the staging dir via virtiofs; a bind mount inside the VM (applied
+          # after boot) exposes the file at its final destination.
+          local filename
+          filename="$(basename "$src")"
+          local file_staging_dir="$AGENT_VM_STATE_DIR/file-mounts/${vm_name}/${staging_idx}"
+          local host_staging="${file_staging_dir}/${filename}"
+          if ! _agent_vm_stage_file "$src" "$host_staging"; then
+            echo "Warning: Failed to stage '${src}', skipping." >&2
+            rm -rf "$file_staging_dir"
+            continue
+          fi
+          local staging_mount="/tmp/.agent-vm-file-mounts/${staging_idx}"
+          local bind_dst="${dst:-${src}}"
+          file_mount_entries+=("${src}|${host_staging}|${staging_mount}/${filename}|${bind_dst}")
+          mounts_json+=", {\"location\": \"${file_staging_dir}\", \"mountPoint\": \"${staging_mount}\", \"writable\": false}"
+          staging_idx=$((staging_idx + 1))
+          continue
+        fi
+        if [[ ! -d "$src" ]]; then
+          echo "Warning: Mount path '${src}' (from ~/.agent-vm/volumes) is not a regular file or directory, skipping." >&2
+          continue
+        fi
+        local writable="false"
+        [[ "$mode" == "rw" ]] && writable="true"
+        if [[ -n "$dst" ]]; then
+          mounts_json+=", {\"location\": \"${src}\", \"mountPoint\": \"${dst}\", \"writable\": ${writable}}"
+        else
+          mounts_json+=", {\"location\": \"${src}\", \"writable\": ${writable}}"
+        fi
+      done < "$mounts_file"
+    fi
+    mounts_json+="]"
+
+    # Persist file mount metadata for re-staging and re-binding on future starts
+    rm -f "$file_mounts_cache"
+    if [[ ${#file_mount_entries[@]} -gt 0 ]]; then
+      printf '%s\n' "${file_mount_entries[@]}" > "$file_mounts_cache"
+    fi
+
     echo "Creating VM '$vm_name'..."
     limactl clone "$AGENT_VM_TEMPLATE" "$vm_name" --tty=false &>/dev/null
     # Apply mount and resource settings via edit after clone
     # Mount and memory/cpus are applied separately from disk, because
     # Lima rejects the entire edit if disk shrinking is attempted.
     local edit_args=()
-    edit_args+=(--set ".mounts = [{\"location\": \"${host_dir}\", \"writable\": true}]")
+    edit_args+=(--set ".mounts = ${mounts_json}")
     [[ -n "$memory" ]] && edit_args+=(--memory "$memory")
     [[ -n "$cpus" ]]   && edit_args+=(--cpus "$cpus")
     (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
@@ -129,7 +244,6 @@ _agent_vm_ensure_running() {
     fi
     echo "Updating VM resources..."
     local edit_args=()
-    edit_args+=(--set ".mounts = [{\"location\": \"${host_dir}\", \"writable\": true}]")
     [[ -n "$memory" ]] && edit_args+=(--memory "$memory")
     [[ -n "$cpus" ]]   && edit_args+=(--cpus "$cpus")
     local edit_output
@@ -204,6 +318,58 @@ _agent_vm_ensure_running() {
     echo "Mounting .git directory as read-only..."
     limactl shell "$vm_name" sudo mount --bind "$host_dir/.git" "$host_dir/.git"
     limactl shell "$vm_name" sudo mount -o remount,ro,bind "$host_dir/.git"
+  fi
+
+  # Load file mount entries from the cache for existing VMs. (New VMs already
+  # populated file_mount_entries and created their hardlinks above.)
+  if [[ -z "$is_new_vm" ]] && [[ -f "$file_mounts_cache" ]]; then
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] && file_mount_entries+=("$entry")
+    done < "$file_mounts_cache"
+
+    # Refresh host-side hardlinks so atomic-rename edits on the host propagate
+    # after a VM restart (ln/cp against the cached staging path).
+    local entry host_src host_staging _bind_src _bind_dst
+    for entry in "${file_mount_entries[@]}"; do
+      IFS='|' read -r host_src host_staging _bind_src _bind_dst <<< "$entry"
+      [[ -z "$host_staging" ]] && continue
+      if [[ ! -e "$host_src" ]]; then
+        echo "Warning: Mount source '${host_src}' no longer exists; VM will see the last-staged copy." >&2
+        continue
+      fi
+      _agent_vm_stage_file "$host_src" "$host_staging" \
+        || echo "Warning: Failed to refresh staged '${host_src}'; VM may see stale content." >&2
+    done
+  fi
+
+  # Apply inside-VM bind mounts so each staged file appears at its final path.
+  # Lima re-mounts staging dirs on each start, but the bind onto the final dest
+  # is ephemeral. Batched into one limactl shell call (roundtrips cost ~1-2s)
+  # and made idempotent so re-runs on a running VM are cheap no-ops.
+  if [[ ${#file_mount_entries[@]} -gt 0 ]]; then
+    local file_bind_payload=()
+    local _host_src _host_staging bind_src bind_dst
+    for entry in "${file_mount_entries[@]}"; do
+      IFS='|' read -r _host_src _host_staging bind_src bind_dst <<< "$entry"
+      [[ -n "$bind_src" && -n "$bind_dst" ]] && file_bind_payload+=("${bind_src}|${bind_dst}")
+    done
+    if [[ ${#file_bind_payload[@]} -gt 0 ]]; then
+      echo "Mounting individual files..."
+      # Paths are passed as positional args (single-quoted script) so entries
+      # containing quotes or metacharacters cannot be interpreted as shell code.
+      limactl shell "$vm_name" sudo bash -c '
+        set -e
+        for entry in "$@"; do
+          bind_src="${entry%%|*}"
+          bind_dst="${entry#*|}"
+          if ! findmnt -no TARGET "$bind_dst" >/dev/null 2>&1; then
+            mkdir -p "$(dirname "$bind_dst")" && touch "$bind_dst"
+            mount --bind "$bind_src" "$bind_dst"
+            mount -o remount,ro,bind "$bind_dst"
+          fi
+        done
+      ' -- "${file_bind_payload[@]}"
+    fi
   fi
 }
 
@@ -334,6 +500,8 @@ VMs are persistent and unique per directory. Running "agent-vm shell" or
 "agent-vm claude" in the same directory will reuse the same VM.
 
 Customization:
+  ~/.agent-vm/volumes               Extra host paths to mount in VMs (one per line,
+                                     supports both directories and individual files)
   ~/.agent-vm/setup.sh              Per-user setup (runs during "agent-vm setup")
   ~/.agent-vm/runtime.sh            Per-user runtime (runs on each VM start)
   <project>/.agent-vm.runtime.sh    Per-project runtime (runs on each VM start)
@@ -646,8 +814,7 @@ _agent_vm_destroy() {
   echo "Stopping and deleting VM '$vm_name'..."
   limactl stop "$vm_name" &>/dev/null
   limactl delete "$vm_name" --force &>/dev/null
-  rm -f "$AGENT_VM_STATE_DIR/.agent-vm-version-${vm_name}"
-  rm -f "$AGENT_VM_STATE_DIR/.agent-vm-term-${vm_name}"
+  _agent_vm_cleanup_state "$vm_name"
   echo "VM destroyed."
 }
 
@@ -671,8 +838,7 @@ _agent_vm_destroy_all() {
     echo "Destroying $vm..."
     limactl stop "$vm" &>/dev/null
     limactl delete "$vm" --force &>/dev/null
-    rm -f "$AGENT_VM_STATE_DIR/.agent-vm-version-${vm}"
-    rm -f "$AGENT_VM_STATE_DIR/.agent-vm-term-${vm_name}"
+    _agent_vm_cleanup_state "$vm"
   done
   echo "All VMs destroyed."
 }

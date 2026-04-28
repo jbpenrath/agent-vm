@@ -522,7 +522,7 @@ _agent_vm_codex() {
   _agent_vm_print_resources "$vm_name"
 
   local exit_code=0
-  limactl shell --workdir "$host_dir" "$vm_name" codex --full-auto "${args[@]}"
+  limactl shell --workdir "$host_dir" "$vm_name" codex --dangerously-bypass-approvals-and-sandbox "${args[@]}"
   exit_code=$?
   [[ -n "$rm" ]] && { echo "Removing VM..."; _agent_vm_destroy; }
   return $exit_code

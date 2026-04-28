@@ -63,7 +63,7 @@ Creates a persistent VM for the current directory (or reuses it if one already e
 Each agent runs with its respective auto-approve flag:
 - `claude` runs with `--dangerously-skip-permissions`
 - `opencode` does not yet have an auto-approve flag (waiting on [this PR](https://github.com/anomalyco/opencode/pull/11833))
-- `codex` runs with `--full-auto`
+- `codex` runs with `--dangerously-bypass-approvals-and-sandbox`
 
 Any extra arguments are forwarded to the agent command:
 
